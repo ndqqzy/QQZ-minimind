@@ -1,6 +1,5 @@
 from transformers import PretrainedConfig
 
-
 class MokioMindConfig(PretrainedConfig):
     model_type = "mokiomind"
 
@@ -70,3 +69,24 @@ class MokioMindConfig(PretrainedConfig):
             if self.inference_rope_scaling
             else None
         )
+
+import torch
+import torch.nn as nn
+
+#先理清思路，rmsnorm是一层，就需要继承nn.Module类
+class RMSNorm(nn.Module):
+
+#既然是类的话就要编写__init__初始化
+    def __init__(self,dim:int,eps:float=1e-5):
+        super().__init__()
+        self.dim=dim#维度
+        self.eps=eps
+        self.weight=nn.Parameter(torch.ones(dim))
+        
+#然后编写_norm计算公式
+    def _norm(self,x):
+        return torch.rsqrt(x.pow(2).mean(-1,keepdim=True)+self.eps)*x
+
+#但nn.Module类需要强制实现forward方法、实现前向传播
+    def forward(self,x):
+        return self.weight*self._norm(x.float()).type_as(x)
