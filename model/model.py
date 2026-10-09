@@ -140,7 +140,7 @@ def precompute_freqs_cis(dim:int,end:int(32*1024),rope_base,rope_scaling:Optiona
         return freqs_cos, freqs_sin
 
 
-# 编写 RoPE
+#################            RoPE            #################
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     # [a, b] -> [-b, a]
     def rotate_half(x):
@@ -159,6 +159,75 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     )
     return q_embed, k_embed
   
+
+#################            GQA            #################
+
+#因为GQA需要重复用到kv，所以先写一个repeat_kv函数，重复kv
+def repeat_kv(x:torch.Tensor,n_rep:int)->torch.Tensor:
+    #x是tensor，n_rep是重复的次数
+    bs,slen,num_key_value_hands,head_dim=x.shape
+    if n_rep==1:
+        return x
+
+    #在第四个维度插入一个新的维度，然后在这个维度上重复n_rep次
+    return (x[:,:,:,None,:]                                 #四个维度插入一个新的维度(bs, slen, num_key_value_heads, 1, head_dim)
+    .expand(bs,slen,num_key_value_hands,n_rep,head_dim)     #扩展复制维度，如果n_rep=2，那么就会在第四个维度上复制两次(bs, slen, num_key_value_heads, 2 , head_dim)
+    .reshape(bs,slen,num_key_value_hands*n_rep,head_dim)    #合并头的维度(bs, slen, 2*num_key_value_heads , head_dim),num_key_value_heads 个 Key/Value 头被扩展成了2倍个，每个头重复 2 次。
+    )
+
+ 
+class Attention(nn.Module):
+    def __init__(self, args: MokioMindConfig):
+        super().__init__()
+
+        # 取key/value头的数量，如果args.num_key_value_heads为None，则使用args.num_attention_heads作为默认值，否则使用参数里的args.num_key_value_heads
+        self.num_key_value_heads = args.num_key_value_heads if args.num_key_value_heads is None else args.num_attention_heads
+
+        #q一定是key和value的整数倍，不然输出报错
+        assert args.num_attention_heads % self.num_key_value_heads == 0, "num_attention_heads must be divisible by num_key_value_heads"
+
+        #设置配置
+        #初始化当前这个实例所使用的头的数量
+        self.n_local_heads = args.num_attention_heads
+        #这个实例使用的key和value的数量等于参数里定义的key和value的数量
+        self.num_key_value_heads = args.num_key_value_heads
+        #重复的key和value的次数等于参数里定义的key和value的数量除以当前实例使用的头的数量
+        self.n_rep=self.num_local_heads // self.num_key_value_heads
+        #每个头的维度等于隐藏层的维度除以当前实例使用的头的数量
+        self.head_dim = args.hidden_size // args.num_attention_heads
+
+
+        #对线性层的qkv进行定义，乘以w（投影层）
+        self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads*self.head_dim, bias=False)
+        self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads*self.head_dim, bias=False)
+        self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads*self.head_dim, bias=False)
+        #输出也有一个线性层，需要用output把前面的数量都拼回来
+        self.o_proj = nn.Linear(args.num_attention_heads*self.head_dim, args.hidden_size, bias=False)
+
+        #其他要用到的参数
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.dropout = args.dropout
+        #是否使用flash attention，flash attention是一种优化的注意力机制，可以减少内存占用和计算量，提高训练速度。
+        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention") and args.flash_attention
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
