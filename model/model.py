@@ -75,7 +75,7 @@ import torch.nn as nn
 import math
 from typing import Optional,Tuple,Union
 from torch.nn import functional as F
-from .activation_functions import ACT2FN
+from transformers.activations import ACT2FN
 from transformers import PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 #################            rmsnorm            #################
@@ -99,9 +99,14 @@ class RMSNorm(nn.Module):
     
 
 #################            rope/yarn            #################
-def precompute_freqs_cis(dim:int,end:int(32*1024),rope_base,rope_scaling:Optional[dict]=None):#end是整个可能处理的序列长度  
+def precomput_freqs_cis(
+        dim:int,
+        end:int = int(32 * 1024),
+        rope_base:float = 1e6,
+        rope_scaling:Optional[dict]=None
+):#end是整个可能处理的序列长度  
     #初始化rope频率
-    freqs,attn_factor=(1.0/(rope_base**(torch.arange(0,dim,2)[:(dim//2)].float()/dim)),1.0)
+    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: dim // 2].float() / dim))
 
     if rope_scaling is not None:#意思是需要用到yarn时
         orig_max,factor,beta_fast,beta_slow = (
@@ -111,40 +116,39 @@ def precompute_freqs_cis(dim:int,end:int(32*1024),rope_base,rope_scaling:Optiona
             rope_scaling["beta_slow"],
         )
         #推断的长度大于训练长度，使用缩放
-        if end>orig_max:
-            #波长b到i的映射
-            inv_dim=lambda b:(dim * math.log(orig_max / (b*2*math.pi))) /(2*math.log(rope_base))
-
-            #划分高低维度
-            #low：不需要缩放的高频部分
-            #high：需要缩放的低频部分
-            low,high=(max(math.floor(inv_dim(beta_fast)),0),min(math.ceil(inv_dim(beta_slow)),dim//2-1))
-
-            #计算缩放因子
-            # low之前，ramp为0，在high之后，ramp为1；在low和high之间，ramp为0到1的线性变化
-            ramp = torch.clamp(
-                (torch.arange(dim // 2, device=freqs.device).float() - low)
-                / max(high - low, 0.001),
-                0,
-                1,
+        if end / orig_max > 1.0:
+            # 计算 corr_dim
+            corr_dim = next(
+                (i for i in range(dim // 2) if 2 * math.pi / freqs[i] > orig_max),
+                dim // 2,
             )
-            # 当 ramp=0 时（高频）：系数为 1，保持原频率不变。
-            # 当 ramp=1 时（低频）：系数为 1/factor，即对频率进行线性插值缩放。
-            # ramp 在 0–1 之间时：平滑过渡。
-            freqs=freqs*(1-ramp+ramp*factor)
-        #根据end，生成位置索引t
-        t=torch.arange(end,device=freqs.device).float()
 
-        # 计算外积，将 t 和频率部分相乘，得到每个位置的旋转角度
-        freqs = torch.outer(t, freqs).float()
+            # 计算 power
+            power = torch.arange(0, dim // 2, device=freqs.device).float() / (
+                max(dim // 2 - 1, 1)
+            )
 
-        freqs_cos = (
-        torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
-        )
-        freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+            # 计算 beta
+            beta = beta_slow + (beta_fast - beta_slow) * power
 
-        return freqs_cos, freqs_sin
+            # 计算 scale
+            scale = torch.where(
+                torch.arange(dim // 2, device=freqs.device) < corr_dim,
+                (beta * factor - beta + 1) / (beta * factor),
+                1.0 / factor,
+            )
 
+            # 应用 scale
+            freqs = freqs * scale
+
+    # 生成位置索引，与频率相乘
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs).float()  # [end, dim//2]
+    
+    # 返回一个 cos 和 sin
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)
+    return freqs_cos, freqs_sin
 
 #################            RoPE            #################
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -187,7 +191,7 @@ class Attention(nn.Module):
         super().__init__()
 
         # 取key/value头的数量，如果args.num_key_value_heads为None，则使用args.num_attention_heads作为默认值，否则使用参数里的args.num_key_value_heads
-        self.num_key_value_heads = args.num_key_value_heads if args.num_key_value_heads is None else args.num_attention_heads
+        self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
 
         #q一定是key和value的整数倍，不然输出报错
         assert args.num_attention_heads % self.num_key_value_heads == 0, "num_attention_heads must be divisible by num_key_value_heads"
@@ -195,8 +199,6 @@ class Attention(nn.Module):
         #设置配置
         #初始化当前这个实例所使用的头的数量
         self.n_local_heads = args.num_attention_heads
-        #这个实例使用的key和value的数量等于参数里定义的key和value的数量
-        self.num_key_value_heads = args.num_key_value_heads
         #重复的key和value的次数等于参数里定义的key和value的数量除以当前实例使用的头的数量
         self.n_rep=self.num_local_heads // self.num_key_value_heads
         #每个头的维度等于隐藏层的维度除以当前实例使用的头的数量
@@ -220,7 +222,7 @@ class Attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        position_embedding: Tuple[torch.Tensor, torch.Tensor],
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache=False,
         attention_mask: Optional[torch.Tensor] = None,
@@ -234,7 +236,7 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
     # q和k：使用roPE
-        cos, sin = position_embedding
+        cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos[:seq_len], sin[:seq_len])
     # 对于k和v，使用repeat（注意kv cache）
         # q、k 已分头，且已对 q、k 应用 RoPE
@@ -287,7 +289,7 @@ class FeedForward(nn.Module):
     def __init__(self,args:MokioMindConfig):
         super().__init__()
         if args.intermediate_size is None:#如果没有指定中间层的大小，就按照hidden_size*8/3来计算
-            args.intermediate_size = int(args.hidden_size*8/3)
+            intermediate_size = int(args.hidden_size*8/3)
             args.intermediate_size = 64*((intermediate_size+64-1)//64)
         #实现投影,升维,降维,门控,dropout,激活函数
         self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
@@ -298,9 +300,8 @@ class FeedForward(nn.Module):
 
         #前向传播
     def forward(self, x):
-        return self.dropout(
-            self.down_proj(self.act_fn(self.gate_proj(x) * self.up_proj(x)))
-    )
+        gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        return self.dropout(self.down_proj(gated))
 
 #Block拼接
 class MokioMindBlock(nn.module):
@@ -343,6 +344,7 @@ class MokioMindBlock(nn.module):
 class MokioMindModel(nn.Module):
     def __init__(self, config: MokioMindConfig):
         super().__init__()
+        self.config = config
         self.vocab_size, self.num_hidden_layers = (
             config.vocab_size,
             config.num_hidden_layers,
@@ -396,13 +398,13 @@ class MokioMindModel(nn.Module):
         )
 
         presents = []
-        for layer_idx, (layer, past_key_values) in enumerate(
+        for layer_idx, (layer, past_key_value) in enumerate(
             zip(self.layers, past_key_values)
         ):
             hidden_states, present = layer(
                 hidden_states,
                 position_embeddings,
-                past_key_value=past_key_values,
+                past_key_value=past_key_value,
                 use_cache=use_cache,
                 attention_mask=attention_mask,
             )
@@ -433,7 +435,6 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
         #输出层的权重和嵌入层的权重共享
         self.model.embed_tokens.weight = self.lm_head.weight
 
-        self.OUT = CausalLMOutputWithPast()
 
     def forward(
         self,
@@ -460,11 +461,11 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
         )
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
-        self.OUT.__setitem__("last_hidden_state", hidden_states)
-        self.OUT.__setitem__("logits", logits)
-        self.OUT.__setitem__("past_key_values", past_key_values)
-        
-        return self.OUT
+        return CausalLMOutputWithPast(
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+        )
 
 
 
