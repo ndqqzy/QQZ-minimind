@@ -53,6 +53,7 @@ def lm_checkpoint(
     weight="full_sft",
     model=None,
     optimizer=None,
+    scaler=None,
     epoch=0,
     step=0,
     wandb=None,
@@ -88,6 +89,7 @@ def lm_checkpoint(
         resume_data = {
             "model": state_dict,
             "optimizer": optimizer.state_dict(),
+            "scaler": scaler.state_dict() if scaler is not None else None,
             "epoch": epoch,
             "step": step,
             "world_size": dist.get_world_size() if dist.is_initialized() else 1,
@@ -110,7 +112,7 @@ def lm_checkpoint(
 
     else:  # 加载模式
         if os.path.exists(resume_path):
-            ckp_data = torch.load(resume_path, map_location="cpu")
+            ckp_data = torch.load(resume_path, map_location="cpu", weights_only=False)
             saved_ws = ckp_data.get("world_size", 1)
             current_ws = dist.get_world_size() if dist.is_initialized() else 1
 

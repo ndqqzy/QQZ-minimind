@@ -70,13 +70,13 @@ class MokioMindConfig(PretrainedConfig):
             else None
         )
 
+import math
 import torch
 import torch.nn as nn
-import math
-from typing import Optional,Tuple,Union
-from torch.nn import functional as F
+import torch.nn.functional as F
+from typing import Optional, Tuple, List, Union
 from transformers.activations import ACT2FN
-from transformers import PreTrainedModel, GenerationMixin
+from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 #################            rmsnorm            #################
 #先理清思路，rmsnorm是一层，就需要继承nn.Module类
@@ -200,7 +200,7 @@ class Attention(nn.Module):
         #初始化当前这个实例所使用的头的数量
         self.n_local_heads = args.num_attention_heads
         #重复的key和value的次数等于参数里定义的key和value的数量除以当前实例使用的头的数量
-        self.n_rep=self.num_local_heads // self.num_key_value_heads
+        self.n_rep=self.n_local_heads // self.num_key_value_heads
         #每个头的维度等于隐藏层的维度除以当前实例使用的头的数量
         self.head_dim = args.hidden_size // args.num_attention_heads
 
@@ -237,9 +237,8 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
     # q和k：使用roPE
         cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb(q, k, cos[:seq_len], sin[:seq_len])
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
     # 对于k和v，使用repeat（注意kv cache）
-        # q、k 已分头，且已对 q、k 应用 RoPE
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
@@ -251,7 +250,7 @@ class Attention(nn.Module):
             repeat_kv(xv, self.n_rep).transpose(1, 2),
         )
     # 进行attention计算，q@k^T/sqrt(d)
-        if self.flash and seq_len > 1 and (attention_mask is None or torch.all(attention_mask == 1)):
+        if self.flash and seq_len > 1 and past_key_value is None and (attention_mask is None or torch.all(attention_mask == 1)):
             attn_mask = (
                 None
                 if attention_mask is None
@@ -263,7 +262,7 @@ class Attention(nn.Module):
             dropout_p=self.dropout if self.training else 0.0, is_causal=True)
         else:
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            scores = scores + torch.triu(
+            scores[:, :, :, -seq_len:] = scores[:, :, :, -seq_len:] + torch.triu(
                 torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
                 diagonal=1,
             ).unsqueeze(0).unsqueeze(0)
@@ -304,7 +303,7 @@ class FeedForward(nn.Module):
         return self.dropout(self.down_proj(gated))
 
 #Block拼接
-class MokioMindBlock(nn.module):
+class MokioMindBlock(nn.Module):
     def __init__(self,layer_id:int,config:MokioMindConfig):
         super().__init__()
         self.num_attention_heads = config.num_attention_heads
@@ -443,6 +442,7 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
         past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
         use_cache: bool = False,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        labels: Optional[torch.Tensor] = None,
         **args,
     ):
         hidden_states, past_key_values = self.model(
@@ -461,7 +461,20 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
         )
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
+        loss = None
+        if labels is not None:
+            if logits.shape[1] != labels.shape[1]:
+                raise ValueError("训练时 logits_to_keep 必须为 0，以保留全部位置的 logits")
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.float().view(-1, shift_logits.shape[-1]),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+
         return CausalLMOutputWithPast(
+            loss=loss,
             logits=logits,
             past_key_values=past_key_values,
             hidden_states=hidden_states,

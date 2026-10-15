@@ -15,7 +15,7 @@ class PretrainDataset(Dataset):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
-        # 使用 HuggingFace datasets 的惰性加载，避免一次性读入大文件
+        # 首次读取会生成 Arrow 缓存；后续从磁盘映射读取
         self.samples = load_dataset("json", data_files=data_path, split="train")
 
     # __len__
@@ -42,7 +42,7 @@ class PretrainDataset(Dataset):
         # 编写 labels，避免 PAD 参与 loss 计算
         labels = input_ids.clone()
         labels[labels == self.tokenizer.pad_token_id] = -100
-        
+
         # 非 PAD 位置为 1，PAD 位置为 0
         attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
         
@@ -51,25 +51,3 @@ class PretrainDataset(Dataset):
             "attention_mask": attention_mask,
             "labels": labels,
         }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
- 

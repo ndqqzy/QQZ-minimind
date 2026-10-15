@@ -15,6 +15,25 @@ source activate.sh
 
 在 VS Code 中打开本机的 `QQZ-minimind.code-workspace`（文件 → 从文件打开工作区），即可使用本目录的解释器配置。若此前手动选过其他解释器，请用“Python: Select Interpreter”选择 `/root/autodl-tmp/envs/minimind/bin/python`。工作区配置和 `activate.sh` 仅用于本机，不提交到 Git。
 
+## 预训练
+
+项目使用 `model/tokenizer.json` 与 `model/tokenizer_config.json` 中的 6400 词表分词器。预训练数据是每行含有 `text` 字段的 JSONL 文件。`dataset/debug_pretrain.jsonl` 是仅用于检查训练链路的小样本；正式数据 `dataset/pretrain_t2t_mini.jsonl` 来自 [MiniMind 数据集](https://huggingface.co/datasets/jingyaogong/minimind_dataset/blob/main/pretrain_t2t_mini.jsonl)，不会提交到 Git。
+
+从项目根目录运行：
+
+```bash
+source activate.sh
+python trainer/train_pretrain.py --data_path dataset/debug_pretrain.jsonl --hidden_size 64 --num_hidden_layers 2 --max_seq_len 32 --batch_size 2 --accumulation_steps 1 --num_workers 0
+```
+
+小样本跑通后，开始正式预训练：
+
+```bash
+python trainer/train_pretrain.py --max_seq_len 320 --batch_size 2 --accumulation_steps 8
+```
+
+默认从头训练，权重写入 `out/`，续训状态写入 `checkpoints/`。中断后用相同的模型参数并添加 `--from_resume 1` 继续。需要改用自己的 JSONL 数据时，传入 `--data_path`。
+
 你可以自由创建 `.py` 文件，或在空白的 `selfminimind.ipynb` 里跟课。Notebook 内核选择 **MiniMind (Python 3.10)**。
 
 视频入口：[第 5 集：架构图解读](https://www.bilibili.com/video/BV1T2k6BaEeC/?p=5)。

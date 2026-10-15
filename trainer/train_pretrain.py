@@ -30,6 +30,8 @@ from trainer.trainer_utils import (  # 训练工具函数
     SkipBatchSampler,
 )
 
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
 # 忽略警告信息，保持输出清洁
 warnings.filterwarnings("ignore")
 
@@ -38,14 +40,12 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()  # 记录开始时间
 
     # 遍历数据批次
-    for step, (input_ids, labels, attention_mask) in enumerate(
+    for step, batch in enumerate(
         loader, start=start_step + 1
     ):
-        input_ids = input_ids.to(args.device)
-        labels = labels.to(args.device)
-        attention_mask = attention_mask.to(
-            args.device
-        )  # ！修正：接收并转移 attention_mask
+        input_ids = batch["input_ids"].to(args.device)
+        labels = batch["labels"].to(args.device)
+        attention_mask = batch["attention_mask"].to(args.device)
 
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
 
@@ -58,15 +58,13 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 input_ids, labels=labels, attention_mask=attention_mask
             )  # ！修正：直接传入labels和attention_mask，由模型内部计算loss
 
-            loss = (
-                res.loss + res.aux_loss
-            )  # ！修正：原手动计算loss_fct+loss_mask，现用模型内置的loss
+            loss = res.loss
 
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
 
-        if step % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0 or step == iters:
             # scaler.unscale_(): 还原梯度的真实值
             scaler.unscale_(optimizer)
 
@@ -128,7 +126,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 epoch=epoch,
                 step=step,
                 wandb=wandb,
-                save_dir="../checkpoints",  # ！修正：原"checkpoints"缺少../前缀
+                save_dir=os.path.join(PROJECT_ROOT, "checkpoints"),
             )
 
             model.train()  # 恢复训练模式
@@ -139,8 +137,8 @@ if __name__ == "__main__":
 
     # ========== 基础训练参数 ==========
     parser.add_argument(
-        "--save_dir", type=str, default="../out", help="模型保存目录"
-    )  # ！修正：原"out"缺少../前缀
+        "--save_dir", type=str, default=os.path.join(PROJECT_ROOT, "out"), help="模型保存目录"
+    )
     parser.add_argument(
         "--save_weight", default="pretrain", type=str, help="保存权重的前缀名"
     )
@@ -186,7 +184,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data_path",
         type=str,
-        default="../dataset/pretrain_hq.jsonl",  # ！修正：原"dataset/..."缺少../前缀
+        default=os.path.join(PROJECT_ROOT, "dataset", "pretrain_t2t_mini.jsonl"),
         help="预训练数据路径",
     )
     parser.add_argument(
@@ -248,8 +246,8 @@ if __name__ == "__main__":
     # 如果开启了断点续训，尝试加载之前的训练状态
     ckp_data = (
         lm_checkpoint(
-            lm_config, weight=args.save_weight, save_dir="../checkpoints"
-        )  # ！修正：原"checkpoints"缺少../前缀
+            lm_config, weight=args.save_weight, save_dir=os.path.join(PROJECT_ROOT, "checkpoints")
+        )
         if args.from_resume == 1
         else None
     )
@@ -303,8 +301,10 @@ if __name__ == "__main__":
     - 缩放器: 混合精度训练的梯度缩放
     """
     # 初始化模型和分词器
-    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    model, tokenizer = init_model(lm_config, args.from_weight, save_dir=args.save_dir, device=args.device)
 
+    if not os.path.isfile(args.data_path):
+        raise FileNotFoundError(f"训练数据不存在：{args.data_path}。请先下载数据，或通过 --data_path 指定文件。")
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
 
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
