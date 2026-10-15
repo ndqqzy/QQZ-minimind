@@ -75,6 +75,7 @@ import torch.nn as nn
 import math
 from typing import Optional,Tuple
 from torch.nn import functional as F
+from .activation_functions import ACT2FN
 #################            rmsnorm            #################
 #先理清思路，rmsnorm是一层，就需要继承nn.Module类
 class RMSNorm(nn.Module):
@@ -276,6 +277,28 @@ class Attention(nn.Module):
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
 
+
+#################            FFN            #################
+# FFN是一层
+class FeedForward(nn.Module):
+    #初始化
+    def __init__(self,args:MokioMindConfig):
+        super().__init__()
+        if args.intermediate_size is None:#如果没有指定中间层的大小，就按照hidden_size*8/3来计算
+            args.intermediate_size = int(args.hidden_size*8/3)
+            args.intermediate_size = 64*((intermediate_size+64-1)//64)
+        #实现投影,升维,降维,门控,dropout,激活函数
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.dropout = nn.Dropout(args.dropout)
+        self.act_fn = ACT2FN[args.hidden_act]
+
+        #前向传播
+    def forward(self, x):
+        return self.dropout(
+            self.down_proj(self.act_fn(self.gate_proj(x) * self.up_proj(x)))
+    )
 
 
 
